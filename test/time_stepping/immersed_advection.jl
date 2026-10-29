@@ -4,6 +4,8 @@ using Oceananigans.ImmersedBoundaries: ImmersedBoundaryGrid, GridFittedBoundary,
 using Oceananigans.Utils: NormalDivision
 using Oceananigans.Advection:
         GhostCells,
+        boundary_distance,
+        ghost_cell_boundary_distances,
         ghost_cell_reconstruction,
         node_differences,
         _symmetric_interpolate_xᶠᵃᵃ,
@@ -259,6 +261,17 @@ for arch in archs
         @test @allowscalar maximum(abs, model.free_surface.displacement) > 0.1
         @test all(isfinite, b)
         @test -0.2 - 1e-10 ≤ minimum(b) && maximum(b) ≤ 1e-10
+    end
+
+    @testset "GhostCells boundary distances at the outermost faces" begin
+        grid = RectilinearGrid(arch, size=(12, 10, 8), extent=(12, 10, 1), halo=(7, 7, 7), topology=(Periodic, Bounded, Bounded))
+        ibg  = ImmersedBoundaryGrid(grid, PartialCellBottom((x, y) -> -1 + 0.5 * exp(-((x - 6)^2 + (y - 5)^2) / 8)))
+        Bᶠ = on_architecture(CPU(), ghost_cell_boundary_distances(ibg)[2])
+        n⁻(i, j, k) = boundary_distance(Bᶠ[i, j, k], Val(1), -1)
+
+        # the backward walk from the outermost x-face stops at the last face whose two cells lie in the halo
+        @test maximum(n⁻(0, j, k) for j in 1:10, k in 1:8) == 5
+        @test n⁻(6, 1, 8) == 6
     end
 
     @testset "Immersed momentum reconstruction" begin

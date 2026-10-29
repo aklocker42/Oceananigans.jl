@@ -52,15 +52,22 @@ end
 # nodes beyond the outermost faces stay within it, and Flat directions, without halo, count none
 @inline function boundary_distance(i, j, k, grid, ℓx, ℓy, ℓz, d::Val{D}, s, M) where D
     di, dj, dk = unit_vector(d)
-    M = min(M, halo_size(grid, D) - 1, 7)
+    H = halo_size(grid, D)
+    M = min(M, H - 1, 7)
+    # a face also reads the cell before it, so the backward walk ends at the first face whose cells are in the halo
+    Mˢ = ifelse(s < 0, (i, j, k)[D] - first_readable_node(H, (ℓx, ℓy, ℓz)[D]), M)
     n = 0
     reached = false
     @unroll for m in 1:M
-        reached |= peripheral_node(i + s * m * di, j + s * m * dj, k + s * m * dk, grid, ℓx, ℓy, ℓz)
+        mˢ = min(m, Mˢ)
+        reached |= (m > Mˢ) | peripheral_node(i + s * mˢ * di, j + s * mˢ * dj, k + s * mˢ * dk, grid, ℓx, ℓy, ℓz)
         n += !reached
     end
     return n
 end
+
+@inline first_readable_node(H, ::Face)   = 2 - H
+@inline first_readable_node(H, ::Center) = 1 - H
 
 @inline function boundary_distance_bits(i, j, k, grid, ℓx, ℓy, ℓz, d, M)
     n⁻ = boundary_distance(i, j, k, grid, ℓx, ℓy, ℓz, d, -1, M)
