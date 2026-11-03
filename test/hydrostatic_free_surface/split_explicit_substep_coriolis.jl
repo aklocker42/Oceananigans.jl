@@ -19,8 +19,13 @@ function substep_coriolis_test_model(arch, timestepper, coriolis, scheme; H = 70
                                         momentum_advection = nothing, tracer_advection = nothing,
                                         tracers = (), buoyancy = nothing)
 
+    # `set!` fills `u` and `v` via separate `Threads.@threads` passes, so only the field
+    # set immediately after a seed reset is guaranteed to draw identically across two
+    # independently-constructed GPU models; reseed before each field to make both reproducible.
     Random.seed!(20260927)
-    set!(model, u = (x, y, z) -> 1e-6 * randn(), v = (x, y, z) -> 1e-6 * randn())
+    set!(model, u = (x, y, z) -> 1e-6 * randn())
+    Random.seed!(20260928)
+    set!(model, v = (x, y, z) -> 1e-6 * randn())
 
     return model
 end
