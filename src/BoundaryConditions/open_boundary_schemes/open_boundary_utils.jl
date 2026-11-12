@@ -22,7 +22,54 @@ const AAC = Tuple{Any, Any, Center}
 @inline anchored_fill(clock) = clock.stage ≤ 1
 @inline anchored_fill(::Nothing) = true
 
+# A scheme anchors at most once per iteration at each boundary point: a second fill in the same iteration
+# recomputes the step from the anchored values instead of advancing it again.
+@inline anchored_fill(clock, anchors, t, k) = anchored_fill(clock) & (@inbounds anchors[t, k] != clock.iteration)
+@inline anchored_fill(::Nothing, anchors, t, k) = true
+
+# A first call initializes the boundary value without taking a step, so it does not count as an anchor.
+@inline record_anchor!(anchors, t, k, clock, anchored, first_call) =
+    @inbounds anchors[t, k] = ifelse(anchored & !first_call, clock.iteration, anchors[t, k])
+
+@inline record_anchor!(anchors, t, k, ::Nothing, anchored, first_call) = nothing
+
 # A `target_transport` is `nothing`, a fixed transport, or a callable of the grid (kept as is).
 convert_target_transport(FT, ::Nothing) = nothing
 convert_target_transport(FT, target_transport::Number) = convert(FT, target_transport)
 convert_target_transport(FT, target_transport) = target_transport
+
+"""
+$(TYPEDEF)
+
+A `target_transport` that varies in time: `values` [m³ s⁻¹] at `times` [s], interpolated linearly in the model time
+and held constant outside `times[1]` and `times[end]`. Evaluated on the host once per barotropic step, so device
+kernels never see it.
+
+$(TYPEDFIELDS)
+
+```jldoctest
+julia> using Oceananigans.BoundaryConditions: TransportTimeSeries
+
+julia> target = TransportTimeSeries([0, 86400], [1e6, 3e6]);
+
+julia> target(43200)
+2.0e6
+```
+"""
+struct TransportTimeSeries{T, V}
+    times  :: T
+    values :: V
+end
+
+convert_target_transport(FT, s::TransportTimeSeries) = TransportTimeSeries(convert.(FT, s.times), convert.(FT, s.values))
+
+function (s::TransportTimeSeries)(t)
+    n = clamp(searchsortedlast(s.times, t), 1, length(s.times) - 1)
+    t₁, t₂ = s.times[n], s.times[n+1]
+    w = clamp((t - t₁) / (t₂ - t₁), 0, 1)
+    return (1 - w) * s.values[n] + w * s.values[n+1]
+end
+
+Adapt.adapt_structure(to, ::TransportTimeSeries) = nothing
+
+Base.summary(s::TransportTimeSeries) = string("TransportTimeSeries with ", length(s.times), " times")

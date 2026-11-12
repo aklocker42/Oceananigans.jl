@@ -2,6 +2,49 @@ using Oceananigans: fields
 using Oceananigans.DistributedComputations: maybe_distributed_fill_halo_regions!
 using KernelAbstractions.Extras.LoopInfo: @unroll
 
+# SW-corner blow-up substep trace (project_bouveco_sw_corner_instability.md, task a, 2026-09-25):
+# combined's outer-iteration corner_block_rank0.jld2 diagnostic shows the blow-up landing between
+# iter 6707-6712; this traces every barotropic substep in that window at (i=1,j=1) to see whether
+# the divergence is already visible sub-iteration, before it shows up in the once-per-outer-iteration
+# corner diagnostic. Toggle by editing these consts directly (env-var gating proved unreliable, see
+# Hunter2006 Bug3 task #305) before rebuilding/resubmitting.
+const _DEBUG_SUBSTEP_TRACE = false
+const _DEBUG_SUBSTEP_ITER_RANGE = 6700:6715
+const _DEBUG_DHU_TRIGGER = 1e-3  # |δh_U| at (1,1); healthy ~1e-5 (jump seen: 5.7e-2)
+const _DEBUG_U_TRIGGER = 100.0   # |U| at the corner; healthy ~49 in the full run (unverified for the MWE)
+
+# #3342 corner-ghost-cell-fill gap, extended to the barotropic transport fields U, V.
+# Their open-boundary sides carry GWNFBC (NormalFlow{GravityWaveRadiation}), a different
+# type from η's IGWVBC, and paired with a non-GWNFBC type on the tangential sides — so
+# neither the generic fallback nor any single-type `corner_fill_kernels` dispatch ever
+# fires for U/V's diagonal corners (same reason u/v need this, not η/T/S). Unlike u/v,
+# U/V are re-filled every barotropic substep (~160/outer step), so this has to run at
+# substep cadence, not once per outer iteration.
+@kernel function _fill_split_explicit_corner_halos!(c, grid, Nk)
+    a, b, k = @index(Global, NTuple)
+    Nx, Ny, _ = size(grid)
+    Hx, Hy = grid.Hx, grid.Hy
+    @inbounds begin
+        iw = 1 - a
+        ie = Nx + a
+        js = 1 - b
+        jn = Ny + b
+
+        c[iw, js, k] = (c[iw, 1,  k] + c[1,  js, k]) / 2  # SW
+        c[ie, js, k] = (c[ie, 1,  k] + c[Nx, js, k]) / 2  # SE
+        c[iw, jn, k] = (c[iw, Ny, k] + c[1,  jn, k]) / 2  # NW
+        c[ie, jn, k] = (c[ie, Ny, k] + c[Nx, jn, k]) / 2  # NE
+    end
+end
+
+function fill_split_explicit_corner_halos!(field::Field)
+    grid = field.grid
+    arch = architecture(grid)
+    Nk = size(field.data, 3)
+    launch!(arch, grid, (grid.Hx, grid.Hy, Nk), _fill_split_explicit_corner_halos!, field.data, grid, Nk)
+    return nothing
+end
+
 # Include buffers for distributed grids
 @inline build_halo_fill_args(f, grid, args...) = (f.data, f.boundary_conditions, f.indices, instantiated_location(f), grid, args...)
 @inline build_halo_fill_args(f, grid::DistributedGrid, args...) = (f.data, f.boundary_conditions, f.indices, instantiated_location(f), grid, f.communication_buffers, args...)
@@ -41,7 +84,7 @@ using KernelAbstractions.Extras.LoopInfo: @unroll
 #
 # The free surface field η and its average η̄ are located on `Face`s at the surface (grid.Nz +1). All other intermediate
 # variables (U, V, Ū, V̄) are barotropic fields (`ReducedField`) for which a k index is not defined.
-@kernel function _split_explicit_barotropic_velocity!(transport_weight, grid, filled_halos, Δτ, η, U, V, Gᵁ, Gⱽ, g, Ũ, Ṽ, timestepper)
+@kernel function _split_explicit_barotropic_velocity!(transport_weight, grid, filled_halos, Δτ, η, U, V, Gᵁ, Gⱽ, g, Ũ, Ṽ, timestepper, clock)
     i, j = @index(Global, NTuple)
     k_top = grid.Nz+1
 
@@ -56,8 +99,20 @@ using KernelAbstractions.Extras.LoopInfo: @unroll
     # Note: use ∂xᵣT and ∂yᵣT (derivatives at constant r) for the free surface,
     # since η lives on the surface and doesn't have vertical structure
     @inbounds begin
-        U[i, j, 1] += Δτ * (- g * Hᶠᶜ * ∂xᵣ(i, j, k_top, grid, η★, timestepper, η) + Gᵁ[i, j, 1])
-        V[i, j, 1] += Δτ * (- g * Hᶜᶠ * ∂yᵣ(i, j, k_top, grid, η★, timestepper, η) + Gⱽ[i, j, 1])
+        px = - g * Hᶠᶜ * ∂xᵣ(i, j, k_top, grid, η★, timestepper, η)
+        py = - g * Hᶜᶠ * ∂yᵣ(i, j, k_top, grid, η★, timestepper, η)
+
+        # 2026-10-02 (job 2410421): corner-only (i<=2,j<=2) gate missed rank 6's blow-up
+        # entirely (0 trace lines there despite a real DomainError) — widened to the whole
+        # local tile so every rank's actual hot spot shows up, not just the near corner.
+        if _DEBUG_SUBSTEP_TRACE &&
+            (clock.iteration ∈ _DEBUG_SUBSTEP_ITER_RANGE || abs(U[i, j, 1]) > _DEBUG_U_TRIGGER || abs(V[i, j, 1]) > _DEBUG_U_TRIGGER)
+            @print("velocity_trace i=", i, " j=", j, " iter=", clock.iteration, " GU=", Gᵁ[i, j, 1], " GV=", Gⱽ[i, j, 1],
+                   " px=", px, " py=", py, " Hx=", Hᶠᶜ, " Hy=", Hᶜᶠ, " U=", U[i, j, 1], " V=", V[i, j, 1],
+                   " eta=", η[i, j, k_top], " etaW=", η[i-1, j, k_top], " etaS=", η[i, j-1, k_top], "\n")
+        end
+        U[i, j, 1] += Δτ * (px + Gᵁ[i, j, 1])
+        V[i, j, 1] += Δτ * (py + Gⱽ[i, j, 1])
 
         # Averaging the transport
         Ũ[i, j, 1] += transport_weight * U[i, j, 1]
@@ -84,6 +139,10 @@ end
         η̅[i, j, k_top] += averaging_weight * η[i, j, k_top]
         U̅[i, j, 1]     += averaging_weight * U[i, j, 1]
         V̅[i, j, 1]     += averaging_weight * V[i, j, 1]
+
+        if _DEBUG_SUBSTEP_TRACE && i == 1 && j == 1 && (clock.iteration ∈ _DEBUG_SUBSTEP_ITER_RANGE || abs(δh_U) > _DEBUG_DHU_TRIGGER)
+            @print("substep_trace iter=", clock.iteration, " U=", U[i, j, 1], " V=", V[i, j, 1], " eta=", η[i, j, k_top], " F=", F(i, j, k_top, grid, clock, (; η, U, V)), " dhU=", δh_U, "\n")
+        end
     end
 end
 
@@ -123,7 +182,7 @@ function iterate_split_explicit!(free_surface::FillHaloSplitExplicit, grid, GU�
     @apply_regionally velocity_kernel!, _     = configure_kernel(arch, grid, parameters, _split_explicit_barotropic_velocity!)
     @apply_regionally free_surface_kernel!, _ = configure_kernel(arch, grid, parameters, _split_explicit_free_surface!)
 
-    U_args = (grid, Val(true), Δτᴮ, η, U, V, GUⁿ, GVⁿ, g, Ũ, Ṽ, timestepper)
+    U_args = (grid, Val(true), Δτᴮ, η, U, V, GUⁿ, GVⁿ, g, Ũ, Ṽ, timestepper, clock)
     η_args = (grid, Val(true), Δτᴮ, η, U, V, F, clock, η̅, U̅, V̅, timestepper)
 
     barotropic_model_fields = (; U, V, η)
@@ -143,13 +202,13 @@ function iterate_split_explicit!(free_surface::FillHaloSplitExplicit, grid, GU�
         @apply_regionally converted_U_halo_args = prepare_halo_fill_args(arch, U_halo_args, grid, free_surface)
         @apply_regionally converted_V_halo_args = prepare_halo_fill_args(arch, V_halo_args, grid, free_surface)
         @apply_regionally converted_η_halo_args = prepare_halo_fill_args(arch, η_halo_args, grid, free_surface)
-        face_pins = configure_face_pins(arch, grid, U, V, free_surface.boundary_transport)
+        face_pins = configure_face_pins(arch, grid, U, V, free_surface.boundary_transport, clock.time)
 
         @unroll for substep in 1:Nsubsteps
             @inbounds averaging_weight = weights[substep]
             @inbounds transport_weight = transport_weights[substep]
 
-            substep_clock = (; time = clock.time + (substep - 1) * Δτᴮ, iteration = clock.iteration, stage = 0, last_stage_Δt = Δτᴮ)
+            substep_clock = (; time = clock.time + (substep - 1) * Δτᴮ, iteration = clock.iteration, stage = 1, last_stage_Δt = Δτᴮ)
 
             maybe_distributed_fill_halo_regions!(arch, converted_η_halo_args[1:end-1]..., substep_clock, converted_η_halo_args[end]; only_local_halos)
             @apply_regionally apply_barotropic_kernel!(velocity_kernel!, transport_weight, converted_U_args)
@@ -157,6 +216,8 @@ function iterate_split_explicit!(free_surface::FillHaloSplitExplicit, grid, GU�
             maybe_distributed_fill_halo_regions!(arch, converted_U_halo_args[1:end-1]..., substep_clock, converted_U_halo_args[end]; only_local_halos)
             maybe_distributed_fill_halo_regions!(arch, converted_V_halo_args[1:end-1]..., substep_clock, converted_V_halo_args[end]; only_local_halos)
             pin_barotropic_faces!(face_pins)
+            fill_split_explicit_corner_halos!(U)
+            fill_split_explicit_corner_halos!(V)
             @apply_regionally apply_barotropic_kernel!(free_surface_kernel!, averaging_weight, converted_η_args)
         end
     end
@@ -184,7 +245,7 @@ function iterate_split_explicit_in_halo!(free_surface, grid, GUⁿ, GVⁿ, Δτ�
     barotropic_velocity_kernel!, _ = configure_kernel(arch, grid, parameters, _split_explicit_barotropic_velocity!)
     free_surface_kernel!, _        = configure_kernel(arch, grid, parameters, _split_explicit_free_surface!)
 
-    U_args = (grid, Val(false), Δτᴮ, η, U, V, GUⁿ, GVⁿ, g, Ũ, Ṽ, timestepper)
+    U_args = (grid, Val(false), Δτᴮ, η, U, V, GUⁿ, GVⁿ, g, Ũ, Ṽ, timestepper, clock)
     η_args = (grid, Val(false), Δτᴮ, η, U, V, F, clock, η̅, U̅, V̅, timestepper)
 
     GC.@preserve U_args η_args begin
@@ -264,6 +325,10 @@ function step_free_surface!(free_surface::SplitExplicitFreeSurface, model, baroc
     # Reset the filtered fields and the barotropic timestepper to zero.
     @apply_regionally initialize_free_surface_state!(free_surface, baroclinic_timestepper, barotropic_timestepper)
 
+    # Substep halo fills read time series up to the last substep time, which can lie past tⁿ⁺¹
+    t = model.clock.time
+    update_model_field_time_series!(model, Time(t), Time(t + (Nsubsteps - 1) * Δτᴮ))
+
     # Solve for the free surface at tⁿ⁺¹.
     iterate_split_explicit!(free_surface, free_surface_grid, GUⁿ, GVⁿ, Δτᴮ, F, model.clock, weights, transport_weights, Val(Nsubsteps))
 
@@ -278,8 +343,7 @@ function step_free_surface!(free_surface::SplitExplicitFreeSurface, model, baroc
     # The Flather refills above undo the pin, so re-pin the faces before the barotropic corrector reads them
     arch = architecture(free_surface_grid)
     boundary_transport = free_surface.boundary_transport
-    enforce_barotropic_transport_targets!(arch, free_surface_grid, U, V, boundary_transport)
-    enforce_barotropic_transport_targets!(arch, free_surface_grid, filtered_state.Ũ, filtered_state.Ṽ, boundary_transport)
+    enforce_barotropic_transport_targets!(arch, free_surface_grid, U, V, boundary_transport, model.clock.time)
 
     return nothing
 end

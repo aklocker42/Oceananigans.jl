@@ -42,8 +42,18 @@ construct_boundary_conditions_kernels(::Missing, data, grid, loc, indices) = mis
         fill_halo_kernel(side, bc, grid, size, offset, data, reduced_dims)
     end
 
-    return NamedTuple{names}(kernels!), NamedTuple{names}(ordered_bcs)
+    corner_kernels, corner_bcs = corner_fill_kernels(bcs, data, grid, loc, indices)
+
+    return merge(NamedTuple{names}(kernels!), corner_kernels), merge(NamedTuple{names}(ordered_bcs), corner_bcs)
 end
+
+# Value/Flux/Gradient BCs never fill the diagonal corner ghost point shared by two adjacent
+# sides (see the non-periodic `fill_halo_size` methods above, which use the interior-only
+# `size(grid, loc)` range, vs. Periodic's halo-inclusive `total_size`); this ordering gap is
+# https://github.com/CliMA/Oceananigans.jl/issues/3342. This is a no-op by default and is
+# overridden only by schemes that own real corner-adjacent physics on all four sides, e.g.
+# TracerReservoir (tracer_reservoir.jl) or ObliqueRadiation (oblique_radiation.jl).
+@inline corner_fill_kernels(bcs::FieldBoundaryConditions, data, grid, loc, indices) = NamedTuple(), NamedTuple()
 
 @inline reduced_dimension(::Nothing, dim) = (dim,)
 @inline reduced_dimension(loc, dim) = ()

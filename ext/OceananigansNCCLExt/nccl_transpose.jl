@@ -101,3 +101,9 @@ function nccl_transpose_y_to_z!(pf, nccl_comm)
     DC.unpack_buffer_z_from_y!(pf.zfield, pf.yfield, pf.yzbuff)
     return nothing
 end
+
+# Stream-ordered on the compute stream, through a communicator of its own so it never interleaves with the halo traffic
+function DC.device_all_reduce!(op, val::CUDA.AnyCuArray, arch::NCCLDistributedArchitecture)
+    NCCL.Allreduce!(val, op, get_nccl_subcomm(arch.communicator.mpi); stream = CUDA.stream())
+    return val
+end

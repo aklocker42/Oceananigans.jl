@@ -31,7 +31,9 @@ free surface displacement).
 positive coordinate direction, to a prescribed value: after the Flather fill of every barotropic substep
 the face transport is shifted uniformly so that its integral along the boundary matches the target, so
 only the shape of the Flather profile survives and the free surface sees exactly the prescribed transport.
-It may be a number or a callable of the grid, and is supported on single-region, non-distributed grids. On an
+It may be a number, a [`TransportTimeSeries`](@ref), or a callable of the grid that returns either of these or a
+callable of the model time; time-dependent targets are evaluated on the host at the start of every barotropic step. On a distributed grid the integral spans all ranks of the side (one all-reduce per substep); multi-region
+grids are not supported. On an
 immersed grid only the wet columns of the side carry the target, and a fully dry side is left untouched. The
 default `nothing` leaves the transport to the Flather condition, which then adds `√(gH)` times the free-surface
 mismatch to `Uᵉˣᵗ`.
@@ -66,8 +68,8 @@ function GravityWaveRadiation(FT = defaults.FloatType;
     return GravityWaveRadiation(gravitational_acceleration, target_transport)
 end
 
-Adapt.adapt_structure(to, f::GravityWaveRadiation) =
-    GravityWaveRadiation(adapt(to, f.gravitational_acceleration), adapt(to, f.target_transport))
+# The target is applied on the host, so device kernels never see it
+Adapt.adapt_structure(to, f::GravityWaveRadiation) = GravityWaveRadiation(adapt(to, f.gravitational_acceleration), nothing)
 
 const GWNFBC = BoundaryCondition{<:NormalFlow{<:GravityWaveRadiation}}
 
@@ -378,4 +380,76 @@ end
     end
 
     return nothing
+end
+
+#####
+##### Corner filling (issue #3342: Value BCs never fill the corner two adjacent sides
+##### share). Unlike TracerReservoir/ObliqueRadiation, η's unfilled corner isn't just
+##### cosmetically wrong: `column_depthᶠᶠᵃ` (mutable_immersed_grid.jl) 2D-interpolates η
+##### onto the vorticity point via `ℑxyᶠᶠᵃ`, which reads the true diagonal neighbor —
+##### feeding a garbage z-star scaling factor σᶠᶠ into the corner-adjacent vorticity/
+##### Coriolis term every RK3 substage (rk_substep_grid! → update_zstar_scaling!,
+##### z_star_coordinate.jl), from iteration 0, independent of whatever
+##### corner_halo_fill.jl does for u/v/T/S. Averages the two already-filled edge-halo
+##### neighbors one step in from the corner, same convention as TracerReservoir/
+##### ObliqueRadiation. Runs every RK3 substage as part of the normal halo fill for η.
+#####
+
+@kernel function _fill_southwest_corner_halo!(η, west_bc::IGWVBC, south_bc::IGWVBC, loc, grid, args)
+    k, = @index(Global, NTuple)
+    ℓx, ℓy, ℓz = loc
+    ηʷ = @inbounds η[0, 1, k]
+    ηˢ = @inbounds η[1, 0, k]
+    closed = immersed_peripheral_node(1, 1, k, grid, Center(), Center(), ℓz)
+    @inbounds η[0, 0, k] = ifelse(closed, zero(grid), (ηʷ + ηˢ) / 2)
+end
+
+@kernel function _fill_southeast_corner_halo!(η, east_bc::IGWVBC, south_bc::IGWVBC, loc, grid, args)
+    k, = @index(Global, NTuple)
+    ℓx, ℓy, ℓz = loc
+    Nx = grid.Nx
+    ηᵉ = @inbounds η[Nx+1, 1, k]
+    ηˢ = @inbounds η[Nx,   0, k]
+    closed = immersed_peripheral_node(Nx, 1, k, grid, Center(), Center(), ℓz)
+    @inbounds η[Nx+1, 0, k] = ifelse(closed, zero(grid), (ηᵉ + ηˢ) / 2)
+end
+
+@kernel function _fill_northwest_corner_halo!(η, west_bc::IGWVBC, north_bc::IGWVBC, loc, grid, args)
+    k, = @index(Global, NTuple)
+    ℓx, ℓy, ℓz = loc
+    Ny = grid.Ny
+    ηʷ = @inbounds η[0, Ny,   k]
+    ηⁿ = @inbounds η[1, Ny+1, k]
+    closed = immersed_peripheral_node(1, Ny, k, grid, Center(), Center(), ℓz)
+    @inbounds η[0, Ny+1, k] = ifelse(closed, zero(grid), (ηʷ + ηⁿ) / 2)
+end
+
+@kernel function _fill_northeast_corner_halo!(η, east_bc::IGWVBC, north_bc::IGWVBC, loc, grid, args)
+    k, = @index(Global, NTuple)
+    ℓx, ℓy, ℓz = loc
+    Nx, Ny = grid.Nx, grid.Ny
+    ηᵉ = @inbounds η[Nx+1, Ny,   k]
+    ηⁿ = @inbounds η[Nx,   Ny+1, k]
+    closed = immersed_peripheral_node(Nx, Ny, k, grid, Center(), Center(), ℓz)
+    @inbounds η[Nx+1, Ny+1, k] = ifelse(closed, zero(grid), (ηᵉ + ηⁿ) / 2)
+end
+
+@inline function corner_fill_kernels(bcs::FieldBoundaryConditions{W, E, S, N}, data, grid, loc, indices) where {W <: IGWVBC, E <: IGWVBC, S <: IGWVBC, N <: IGWVBC}
+    arch = architecture(grid)
+    Sy, Sz = fill_halo_size(data, West(), indices, bcs.west, loc, grid)
+    # η lives at k = Nz + 1, so the vertical launch range must start from the field's own index, not 1
+    _, Oz = fill_halo_offset((Sy, Sz), West(), indices)
+    size, offset = (Sz,), (Oz,)
+    reduced_dims = reduced_dimensions(loc)
+
+    sw = configure_kernel(arch, grid, kernel_parameters(size, offset), _fill_southwest_corner_halo!; reduced_dimensions=reduced_dims)[1]
+    se = configure_kernel(arch, grid, kernel_parameters(size, offset), _fill_southeast_corner_halo!; reduced_dimensions=reduced_dims)[1]
+    nw = configure_kernel(arch, grid, kernel_parameters(size, offset), _fill_northwest_corner_halo!; reduced_dimensions=reduced_dims)[1]
+    ne = configure_kernel(arch, grid, kernel_parameters(size, offset), _fill_northeast_corner_halo!; reduced_dimensions=reduced_dims)[1]
+
+    kernels = (southwest = sw, southeast = se, northwest = nw, northeast = ne)
+    corner_bcs = (southwest = (bcs.west, bcs.south), southeast = (bcs.east, bcs.south),
+                  northwest = (bcs.west, bcs.north), northeast = (bcs.east, bcs.north))
+
+    return kernels, corner_bcs
 end
