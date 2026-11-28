@@ -1,4 +1,4 @@
-using Oceananigans.Grids: surface_kernel_parameters, volume_kernel_parameters
+using Oceananigans.Grids: halo_size, open_boundary_range, surface_kernel_parameters, volume_kernel_parameters
 using Oceananigans.ImmersedBoundaries: immersed_inactive_node, immersed_peripheral_node
 
 # Kernels to compute the vertical integral of the velocities
@@ -155,16 +155,19 @@ end
 
 correct_boundary_columns!(bc, side, velocity, transport) = nothing
 
-correct_boundary_columns!(::RNFBC, ::West,  u, U) = launch!(architecture(u.grid), u.grid, (size(u.grid, 2),), _correct_x_boundary_columns!, u, U, u.grid, 1)
-correct_boundary_columns!(::RNFBC, ::East,  u, U) = launch!(architecture(u.grid), u.grid, (size(u.grid, 2),), _correct_x_boundary_columns!, u, U, u.grid, size(u.grid, 1) + 1)
-correct_boundary_columns!(::RNFBC, ::South, v, V) = launch!(architecture(v.grid), v.grid, (size(v.grid, 1),), _correct_y_boundary_columns!, v, V, v.grid, 1)
-correct_boundary_columns!(::RNFBC, ::North, v, V) = launch!(architecture(v.grid), v.grid, (size(v.grid, 1),), _correct_y_boundary_columns!, v, V, v.grid, size(v.grid, 2) + 1)
+# The columns along the face span the range the boundary step covers
+boundary_columns(grid, d) = KernelParameters(open_boundary_range(Center(), topology(grid, d), size(grid, d), halo_size(grid, d)))
+
+correct_boundary_columns!(::RNFBC, ::West,  u, U) = launch!(architecture(u.grid), u.grid, boundary_columns(u.grid, 2), _correct_x_boundary_columns!, u, U, u.grid, 1)
+correct_boundary_columns!(::RNFBC, ::East,  u, U) = launch!(architecture(u.grid), u.grid, boundary_columns(u.grid, 2), _correct_x_boundary_columns!, u, U, u.grid, size(u.grid, 1) + 1)
+correct_boundary_columns!(::RNFBC, ::South, v, V) = launch!(architecture(v.grid), v.grid, boundary_columns(v.grid, 1), _correct_y_boundary_columns!, v, V, v.grid, 1)
+correct_boundary_columns!(::RNFBC, ::North, v, V) = launch!(architecture(v.grid), v.grid, boundary_columns(v.grid, 1), _correct_y_boundary_columns!, v, V, v.grid, size(v.grid, 2) + 1)
 
 @inline peripheral_or_inactiveᶠᶜᶜ(i, j, k, grid) = immersed_peripheral_node(i, j, k, grid, Face(), Center(), Center()) | immersed_inactive_node(i, j, k, grid, Face(), Center(), Center())
 @inline peripheral_or_inactiveᶜᶠᶜ(i, j, k, grid) = immersed_peripheral_node(i, j, k, grid, Center(), Face(), Center()) | immersed_inactive_node(i, j, k, grid, Center(), Face(), Center())
 
 @kernel function _correct_x_boundary_columns!(u, U, grid, i)
-    j = @index(Global, Linear)
+    j, = @index(Global, NTuple)
     Hᶠᶜ = column_depthᶠᶜᵃ(i, j, grid)
 
     ∫u = zero(grid)
@@ -180,7 +183,7 @@ correct_boundary_columns!(::RNFBC, ::North, v, V) = launch!(architecture(v.grid)
 end
 
 @kernel function _correct_y_boundary_columns!(v, V, grid, j)
-    i = @index(Global, Linear)
+    i, = @index(Global, NTuple)
     Hᶜᶠ = column_depthᶜᶠᵃ(i, j, grid)
 
     ∫v = zero(grid)

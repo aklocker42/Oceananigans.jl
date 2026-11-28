@@ -74,6 +74,11 @@ const BoundaryTopology = TwoSided{<:BoundarySide, <:BoundarySide}
 @inline connected_range(::Type{<:TwoSided{Connected, <:BoundarySide}}, N, H) = -H+2:N
 @inline connected_range(::Type{<:DistributedFoldedTopology}, N, H) = -H+2:N+H-1
 
+# Open boundaries are stepped after the halo fill, so along the face they also cover a periodic halo
+@inline open_boundary_range(ℓ, topo, N, H)                     = connected_range(ℓ, topo, N, H)
+@inline open_boundary_range(ℓ, ::Type{Periodic}, N, H)         = -H+2:N+H-1
+@inline open_boundary_range(::Nothing, ::Type{Periodic}, N, H) = 1:N
+
 const AT = AbstractTopology
 
 Base.length(::Face,    ::FaceExtendedTopology, N) = N + 1

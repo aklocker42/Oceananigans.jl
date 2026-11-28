@@ -54,7 +54,10 @@ connected_fill_extent(side, bc, size, offset, indices, loc, grid) = size, offset
 connected_fill_extent(side::Union{WEB, SNB}, ::PBC, size, offset, indices, loc, grid) = size, offset
 
 # Extent for lateral fills that also cover the Connected halo along the boundary. Only needed for horizontal boundaries
-function connected_fill_extent(side::Union{WEB, SNB}, bc, size, offset, indices, loc, grid)
+connected_fill_extent(side::Union{WEB, SNB}, bc, size, offset, indices, loc, grid) =
+    tangential_extent(connected_range, side, size, offset, indices, loc, grid)
+
+function tangential_extent(tangential_range, side, size, offset, indices, loc, grid)
     d = tangential_dimension(side)
 
     if !(indices[d] isa Colon) # Windowed fields... we bypass
@@ -64,7 +67,7 @@ function connected_fill_extent(side::Union{WEB, SNB}, bc, size, offset, indices,
     tangential_size, vertical_size = size # The vertical direction is always the last
     _, vertical_offset = offset
 
-    range = connected_range(loc[d], topology(grid, d), tangential_size, halo_size(grid, d))
+    range = tangential_range(loc[d], topology(grid, d), tangential_size, halo_size(grid, d))
     new_size   = (length(range),    vertical_size)
     new_offset = (first(range) - 1, vertical_offset)
 

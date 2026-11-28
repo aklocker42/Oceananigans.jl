@@ -64,8 +64,8 @@ function materialize_radiation_storage(scheme::AbstractRadiationScheme, grid, lo
     Hx, Hy, _ = halo_size(grid)
     arch = architecture(grid)
 
-    tangential_ranges = dim == 1 ? (connected_range(loc[2], topology(grid, 2), Sy, Hy), 1:Sz) :
-                        dim == 2 ? (connected_range(loc[1], topology(grid, 1), Sx, Hx), 1:Sz) :
+    tangential_ranges = dim == 1 ? (open_boundary_range(loc[2], topology(grid, 2), Sy, Hy), 1:Sz) :
+                        dim == 2 ? (open_boundary_range(loc[1], topology(grid, 1), Sx, Hx), 1:Sz) :
                                    (1:Sx, 1:Sy)
 
     buffer() = StaticStridesOffsetArray(zeros(arch, FT, map(length, tangential_ranges)...), map(r -> first(r) - 1, tangential_ranges)...)
@@ -107,10 +107,14 @@ function update_exterior_state!(update!, bc, side, field, args...)
     loc = instantiated_location(field)
     size = fill_halo_size(field.data, side, field.indices, bc, loc, grid)
     offset = fill_halo_offset(size, side, field.indices)
-    size, offset = connected_fill_extent(side, bc, size, offset, field.indices, loc, grid)
+    size, offset = exterior_extent(side, size, offset, field.indices, loc, grid)
     launch!(architecture(grid), grid, kernel_parameters(size, offset), _update_exterior_state!, update!, field.data, side, bc, loc, grid, args)
     return nothing
 end
+
+exterior_extent(side, size, offset, indices, loc, grid) = size, offset
+exterior_extent(side::Union{WEB, SNB}, size, offset, indices, loc, grid) =
+    tangential_extent(open_boundary_range, side, size, offset, indices, loc, grid)
 
 step_boundary_condition!(bc::RBC, side, field, clock, model_fields, Δt) = update_exterior_state!(step_exterior_state!, bc, side, field, clock, model_fields, Δt)
 cache_boundary_condition!(bc::RBC, side, field, clock, model_fields) = update_exterior_state!(cache_exterior_state!, bc, side, field)
